@@ -22,6 +22,10 @@ from flash_attn.cute import flash_attn_func, flash_attn_varlen_func
 out = flash_attn_func(q, k, v, causal=True)
 ```
 
+For the opt-in SM103 D128/D256 preferred 8CTA / fallback 2CTA forward path,
+see [preferred-cluster attention](docs/preferred_clusters.md), including
+supported configurations and a CUDA-event benchmark with frequency monitoring.
+
 ## Development
 
 ```sh
