@@ -839,6 +839,26 @@ def _flash_attn_fwd(
     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
 
+    requested_fwd_cluster_mode = utils._get_fwd_cluster_mode()
+    use_preferred_cluster = (
+        requested_fwd_cluster_mode == "8cta+2cta/2cta"
+        and arch == 103
+        and q_dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2)
+        and batch_size == 1
+        and head_dim == head_dim_v
+        and (
+            (head_dim in (128, 256) and num_head == num_head_kv == 24)
+            or (head_dim == 256 and num_head == 128 and num_head_kv == 1)
+        )
+        and seqlen_q == seqlen_k
+        and use_2cta_instrs
+        and not causal and not local and not is_split_kv
+        and cu_seqlens_q is None and cu_seqlens_k is None
+        and seqused_q is None and seqused_k is None
+        and not use_block_sparsity and page_table is None
+    )
+    fwd_cluster_mode = "8cta+2cta/2cta" if use_preferred_cluster else "2cta"
+
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
         score_mod = utils.create_softcap_scoremod(softcap)
@@ -1084,6 +1104,10 @@ def _flash_attn_fwd(
         and not is_split_kv
     )
 
+    if use_preferred_cluster:
+        # Launch all work; hardware cluster placement does not require persistence.
+        is_static_persistent = False
+
     # CuTe keeps stride-zero modes static when marking layouts dynamic.
     tensor_broadcast_patterns = tuple(
         get_broadcast_dims(tensor) if tensor is not None else None
@@ -1145,6 +1169,8 @@ def _flash_attn_fwd(
         mma_pv_is_rs,
         intra_wg_overlap,
         use_clc_scheduler,
+        fwd_cluster_mode,
+        utils._get_hd256_kv_stage() if use_dedicated_hd256_kernel else None,
         num_splits_dynamic is not None,
         virtual_batch_idx is not None,
         num_nheads_in_l2 is not None,
@@ -1354,6 +1380,7 @@ def _flash_attn_fwd(
                     use_2cta_instrs=use_2cta_instrs,
                     use_clc_scheduler=use_clc_scheduler,
                     seqlen_k_per_split=seqlen_k_per_split,
+                    fwd_cluster_mode=fwd_cluster_mode,
                 )
                 if not use_dedicated_hd256_kernel:
                     fa_fwd_kwargs["has_tile_count_semaphore"] = tile_count_semaphore is not None

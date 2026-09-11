@@ -1,7 +1,7 @@
 # Copyright (c) 2025, Siyu Wang, Shengbin Di, Yuxi Chi, Johnsonms, Linfeng Zheng, Haoyan Huang, Lanbo Li, Yun Zhong, Man Yuan, Minmin Sun, Yong Li, Wei Lin.
 
 import math
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Literal
 
 import cuda.bindings.driver as cuda
 
@@ -30,6 +30,7 @@ from flash_attn.cute.mask import (
 from flash_attn.cute.tile_scheduler import SM100_TMEM_CAPACITY_COLUMNS
 from flash_attn.cute.flash_fwd_sm100 import DescaleTensors, _TUNING_CONFIG
 from flash_attn.cute.utils import ex2_emulation_2, as_bshkrd_tensor, AuxData
+from flash_attn.cute import utils as fa_utils
 
 
 class BlackwellFusedMultiHeadAttentionForward:
@@ -57,6 +58,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         use_clc_scheduler: bool = False,
         has_tile_count_semaphore: bool = False,
         seqlen_k_per_split: Optional[int] = None,
+        fwd_cluster_mode: Literal["2cta", "8cta+2cta/2cta"] = "2cta",
     ):
         head_dim_v = head_dim if head_dim_v is None else head_dim_v
         assert head_dim == 256 and head_dim_v == 256, (
@@ -109,21 +111,31 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
         self.iterations_qk = self.cta_tiler[2] // self.qk_mma_tiler[2]
         self.iterations_pv = self.cta_tiler[2] // self.pv_mma_tiler[1]
-        self.cluster_shape_mn = (2, 1)
+        assert fwd_cluster_mode in ("2cta", "8cta+2cta/2cta")
+        self.fwd_cluster_mode = fwd_cluster_mode
+        self.cluster_shape_mn = (
+            (8, 1) if fwd_cluster_mode == "8cta+2cta/2cta" else (2, 1)
+        )
+        self.fallback_cluster_shape_mn = (
+            (2, 1) if fwd_cluster_mode == "8cta+2cta/2cta" else None
+        )
         self.tmem_warp_shape_mn = (4, 1)
-        # Dedicated hd256 kernel uses fixed scheduling policy.
-        self.is_persistent = False
         self.is_causal = is_causal
         self.is_local = is_local
         self.use_semantic_trip_range = is_causal or is_local
+        # Preserve the dedicated kernel's nonpersistent scheduling policy.
         self.use_clc_scheduler = False
+        # Preferred/fallback cluster placement does not require work stealing.
+        # Without CLC, launch the complete tile grid just as the plain 2CTA
+        # kernel does; a persistent static grid would leave work undispatched.
+        self.is_persistent = self.use_clc_scheduler
 
         self.softmax_warp_ids = (0, 1, 2, 3)
         self.correction_warp_ids = (4, 5, 6, 7)
         self.mma_warp_id = 8
         self.load_warp_id = 9
         self.empty_warp_id = (10, 11)
-        self.sched_warp_id = self.empty_warp_id[0] if use_clc_scheduler else None
+        self.sched_warp_id = self.empty_warp_id[0] if self.use_clc_scheduler else None
         self.tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
         self.threads_per_warp = 32
@@ -159,7 +171,7 @@ class BlackwellFusedMultiHeadAttentionForward:
 
     def _setup_attributes(self):
         self.q_stage = self.iterations_qk
-        self.kv_stage = 4
+        self.kv_stage = fa_utils._get_hd256_kv_stage()
         self.qk_acc_stage = 2
         self.mma_corr_stage = 1
         if cutlass.const_expr(self.use_clc_scheduler):
@@ -406,6 +418,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 self.cta_tiler,
                 self.is_persistent,
             )
+        self.fallback_tile_sched_params = self.tile_sched_params
 
         self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
         self.k_major_mode = utils.LayoutEnum.from_tensor(k).mma_major_mode()
@@ -449,9 +462,18 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
 
         self.cluster_shape_mnk = (*self.cluster_shape_mn, 1)
-        self.cluster_layout_vmnk = cute.tiled_divide(
-            cute.make_layout(self.cluster_shape_mnk),
-            (qk_tiled_mma.thr_id.shape,),
+        self.mma_cta_layout_vmnk = cute.tiled_divide(
+            cute.make_layout((2, 1, 1)), (qk_tiled_mma.thr_id.shape,)
+        )
+        self.cluster_layout_vmnk = (
+            cute.make_layout((2, 1, 1, 4), stride=(1, 0, 0, 2))
+            if cutlass.const_expr(self.fwd_cluster_mode == "8cta+2cta/2cta")
+            else self.mma_cta_layout_vmnk
+        )
+        self.kv_cluster_layout_vmnk = (
+            cute.make_layout((2, 4, 1, 1), stride=(1, 2, 0, 0))
+            if cutlass.const_expr(self.fwd_cluster_mode == "8cta+2cta/2cta")
+            else self.mma_cta_layout_vmnk
         )
 
         self.epi_tile = self.pv_block_tiler[:2]
@@ -481,8 +503,14 @@ class BlackwellFusedMultiHeadAttentionForward:
             self.v_dtype,
             self.kv_stage,
         )
-        # TMA load for Q
+        # Q remains private to one 2CTA MMA group. Preferred-cluster K/V uses
+        # rank-preserving multicast across the four 2CTA groups.
         tma_load_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(cta_group)
+        tma_load_op_kv = (
+            cute.nvgpu.cpasync.CopyBulkTensorTileG2SMulticastOp(cta_group)
+            if cutlass.const_expr(self.fwd_cluster_mode == "8cta+2cta/2cta")
+            else tma_load_op
+        )
 
         q_smem_layout = cute.select(q_smem_layout_staged, mode=[0, 1, 2])
         tma_atom_q, tma_tensor_q = cute.nvgpu.make_tiled_tma_atom_A(
@@ -491,29 +519,48 @@ class BlackwellFusedMultiHeadAttentionForward:
             q_smem_layout,
             self.qk_mma_tiler,
             qk_tiled_mma,
-            self.cluster_layout_vmnk.shape,
+            self.mma_cta_layout_vmnk.shape,
         )
 
         # TMA load for K
         k_smem_layout = cute.select(k_smem_layout_staged, mode=[0, 1, 2])
         tma_atom_k, tma_tensor_k = cute.nvgpu.make_tiled_tma_atom_B(
-            tma_load_op,
+            tma_load_op_kv,
             k,
             k_smem_layout,
             self.qk_mma_tiler,
             qk_tiled_mma,
-            self.cluster_layout_vmnk.shape,
+            self.kv_cluster_layout_vmnk.shape,
         )
         # TMA load for V
         v_smem_layout = cute.select(v_smem_layout_staged, mode=[0, 1, 2])
         tma_atom_v, tma_tensor_v = cute.nvgpu.make_tiled_tma_atom_B(
-            tma_load_op,
+            tma_load_op_kv,
             v,
             v_smem_layout,
             self.pv_mma_tiler,
             pv_tiled_mma,
-            self.cluster_layout_vmnk.shape,
+            self.kv_cluster_layout_vmnk.shape,
         )
+        tma_atom_k_fallback, tma_tensor_k_fallback = tma_atom_k, tma_tensor_k
+        tma_atom_v_fallback, tma_tensor_v_fallback = tma_atom_v, tma_tensor_v
+        if cutlass.const_expr(self.fwd_cluster_mode == "8cta+2cta/2cta"):
+            tma_atom_k_fallback, tma_tensor_k_fallback = cute.nvgpu.make_tiled_tma_atom_B(
+                tma_load_op,
+                k,
+                k_smem_layout,
+                self.qk_mma_tiler,
+                qk_tiled_mma,
+                self.mma_cta_layout_vmnk.shape,
+            )
+            tma_atom_v_fallback, tma_tensor_v_fallback = cute.nvgpu.make_tiled_tma_atom_B(
+                tma_load_op,
+                v,
+                v_smem_layout,
+                self.pv_mma_tiler,
+                pv_tiled_mma,
+                self.mma_cta_layout_vmnk.shape,
+            )
 
         q_copy_size = cute.size_in_bytes(self.q_dtype, q_smem_layout)
         k_copy_size = cute.size_in_bytes(self.k_dtype, k_smem_layout)
@@ -546,7 +593,9 @@ class BlackwellFusedMultiHeadAttentionForward:
             tmem_holding_buf: Int32
             # CLC pipeline barriers and response buffer
             clc_mbar_ptr: cute.struct.MemRange[Int64, 2]
-            clc_response: cute.struct.MemRange[Int32, 4]
+            clc_response: cute.struct.Align[
+                cute.struct.MemRange[Int32, 4], 16
+            ]
 
         self.shared_storage = SharedStorage
 
@@ -561,6 +610,10 @@ class BlackwellFusedMultiHeadAttentionForward:
             tma_tensor_k,
             tma_atom_v,
             tma_tensor_v,
+            tma_atom_k_fallback,
+            tma_tensor_k_fallback,
+            tma_atom_v_fallback,
+            tma_tensor_v_fallback,
             o,
             cum_seqlen_q,
             cum_seqlen_k,
@@ -573,22 +626,109 @@ class BlackwellFusedMultiHeadAttentionForward:
             window_size_left,
             window_size_right,
             self.cluster_layout_vmnk,
+            self.kv_cluster_layout_vmnk,
+            self.mma_cta_layout_vmnk,
             q_smem_layout_staged,
             k_smem_layout_staged,
             p_tmem_layout,
             v_smem_layout_staged,
             self.tile_sched_params,
+            self.fallback_tile_sched_params,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
             cluster=self.cluster_shape_mnk,
+            fallback_cluster=(2, 1, 1)
+            if self.fwd_cluster_mode == "8cta+2cta/2cta"
+            else None,
             stream=stream,
+            smem_merge_branch_allocs=True,
             min_blocks_per_mp=1,
         )
 
-    #  GPU device kernel
     @cute.kernel
     def kernel(
+        self,
+        qk_tiled_mma: cute.TiledMma,
+        pv_tiled_mma: cute.TiledMma,
+        tma_atom_q: cute.CopyAtom,
+        mQ_qdl: cute.Tensor,
+        tma_atom_k: cute.CopyAtom,
+        mK_kdl: cute.Tensor,
+        tma_atom_v: cute.CopyAtom,
+        mV_dkl: cute.Tensor,
+        tma_atom_k_fallback: cute.CopyAtom,
+        mK_fallback: cute.Tensor,
+        tma_atom_v_fallback: cute.CopyAtom,
+        mV_fallback: cute.Tensor,
+        mO_qdl: cute.Tensor,
+        cum_seqlen_q: Optional[cute.Tensor],
+        cum_seqlen_k: Optional[cute.Tensor],
+        mLSE: Optional[cute.Tensor],
+        scale_softmax_log2: Float32,
+        scale_softmax: Float32,
+        scale_output: Float32,
+        mPageTable: Optional[cute.Tensor],
+        max_seqlen_k: Optional[Int32],
+        window_size_left: Optional[Int32],
+        window_size_right: Optional[Int32],
+        cluster_layout_vmnk: cute.Layout,
+        kv_cluster_layout_vmnk: cute.Layout,
+        fallback_layout_vmnk: cute.Layout,
+        q_smem_layout_staged: cute.ComposedLayout,
+        k_smem_layout_staged: cute.ComposedLayout,
+        p_tmem_layout_staged: cute.ComposedLayout,
+        v_smem_layout_staged: cute.ComposedLayout,
+        tile_sched_params: FmhaStaticTileSchedulerParams | FmhaClcDynamicTileSchedulerParams,
+        fallback_tile_sched_params: FmhaStaticTileSchedulerParams | FmhaClcDynamicTileSchedulerParams,
+    ):
+        if cutlass.const_expr(self.fwd_cluster_mode == "8cta+2cta/2cta"):
+            cbdim_x, cbdim_y, cbdim_z = cute.arch.block_in_cluster_dim()
+            is_preferred_cluster = cbdim_x == 8 and cbdim_y == 1 and cbdim_z == 1
+            if is_preferred_cluster:
+                self.cluster_specific_kernel(
+                    qk_tiled_mma, pv_tiled_mma,
+                    tma_atom_q, mQ_qdl,
+                    tma_atom_k, mK_kdl, tma_atom_v, mV_dkl,
+                    mO_qdl, cum_seqlen_q, cum_seqlen_k, mLSE,
+                    scale_softmax_log2, scale_softmax, scale_output,
+                    mPageTable, max_seqlen_k, window_size_left, window_size_right,
+                    cluster_layout_vmnk, kv_cluster_layout_vmnk,
+                    q_smem_layout_staged, k_smem_layout_staged,
+                    p_tmem_layout_staged, v_smem_layout_staged,
+                    tile_sched_params, True,
+                )
+            else:
+                self.cluster_specific_kernel(
+                    qk_tiled_mma, pv_tiled_mma,
+                    tma_atom_q, mQ_qdl,
+                    tma_atom_k_fallback, mK_fallback,
+                    tma_atom_v_fallback, mV_fallback,
+                    mO_qdl, cum_seqlen_q, cum_seqlen_k, mLSE,
+                    scale_softmax_log2, scale_softmax, scale_output,
+                    mPageTable, max_seqlen_k, window_size_left, window_size_right,
+                    fallback_layout_vmnk, fallback_layout_vmnk,
+                    q_smem_layout_staged, k_smem_layout_staged,
+                    p_tmem_layout_staged, v_smem_layout_staged,
+                    fallback_tile_sched_params, False,
+                )
+        else:
+            self.cluster_specific_kernel(
+                qk_tiled_mma, pv_tiled_mma,
+                tma_atom_q, mQ_qdl,
+                tma_atom_k_fallback, mK_fallback,
+                tma_atom_v_fallback, mV_fallback,
+                mO_qdl, cum_seqlen_q, cum_seqlen_k, mLSE,
+                scale_softmax_log2, scale_softmax, scale_output,
+                mPageTable, max_seqlen_k, window_size_left, window_size_right,
+                fallback_layout_vmnk, fallback_layout_vmnk,
+                q_smem_layout_staged, k_smem_layout_staged,
+                p_tmem_layout_staged, v_smem_layout_staged,
+                fallback_tile_sched_params, False,
+            )
+
+    @cute.jit
+    def cluster_specific_kernel(
         self,
         qk_tiled_mma: cute.TiledMma,
         pv_tiled_mma: cute.TiledMma,
@@ -610,11 +750,13 @@ class BlackwellFusedMultiHeadAttentionForward:
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
         cluster_layout_vmnk: cute.Layout,
+        kv_cluster_layout_vmnk: cute.Layout,
         q_smem_layout_staged: cute.ComposedLayout,
         k_smem_layout_staged: cute.ComposedLayout,
         p_tmem_layout_staged: cute.ComposedLayout,
         v_smem_layout_staged: cute.ComposedLayout,
         tile_sched_params: FmhaStaticTileSchedulerParams | FmhaClcDynamicTileSchedulerParams,
+        is_kv_mcast: cutlass.Constexpr[bool],
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -630,6 +772,14 @@ class BlackwellFusedMultiHeadAttentionForward:
         mma_tile_coord_v = bidx % cute.size(qk_tiled_mma.thr_id.shape)
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
+        block_in_kv_cluster_coord_vmnk = kv_cluster_layout_vmnk.get_flat_coord(
+            cta_rank_in_cluster
+        )
+        cluster_size = cute.size(cluster_layout_vmnk)
+        # UTCMMA.2CTA couples exactly one V-pair.  An 8-CTA preferred cluster is
+        # four independent 2-CTA MMA groups; its UMMA-bridging barriers must
+        # therefore count participants from one pair, not from all eight CTAs.
+        mma_group_size = cute.size(qk_tiled_mma.thr_id.shape)
 
         # Alloc
         smem = utils.SmemAllocator()
@@ -642,22 +792,41 @@ class BlackwellFusedMultiHeadAttentionForward:
             tx_count=self.tma_copy_q_bytes,
             barrier_storage=storage.load_q_mbar_ptr.data_ptr(),
             cta_layout_vmnk=cluster_layout_vmnk,
+            mcast_mode_mn=(1, 0),
             defer_sync=True,
         ).make_participants()
-        load_kv_producer, load_kv_consumer = pipeline.PipelineTmaUmma.create(
+        load_kv_pipeline = pipeline.PipelineTmaUmma.create(
             num_stages=self.kv_stage,
             producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
-            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
+            consumer_group=make_thread_cooperative_group(
+                self.threads_per_warp if cutlass.const_expr(is_kv_mcast) else 1
+            ),
             tx_count=self.tma_copy_kv_bytes,
             barrier_storage=storage.load_kv_mbar_ptr.data_ptr(),
-            cta_layout_vmnk=cluster_layout_vmnk,
+            cta_layout_vmnk=kv_cluster_layout_vmnk,
+            mcast_mode_mn=(0, 1),
+            enable_multicast_signaling=is_kv_mcast,
             defer_sync=True,
-        ).make_participants()
+        )
+        load_kv_producer, load_kv_consumer = load_kv_pipeline.make_participants()
+        # The pipeline arrival mask covers both V ranks because UTCMMA.2CTA
+        # completion is pair-wide.  It is not the TMA data multicast mask.
+        # Each TMA B-rank transaction must target only the four CTAs carrying
+        # that same V rank across the independent MMA groups.
+        kv_mcast_mask = (
+            cute.nvgpu.cpasync.create_tma_multicast_mask(
+                kv_cluster_layout_vmnk,
+                block_in_kv_cluster_coord_vmnk,
+                mcast_mode=1,
+            )
+            if cutlass.const_expr(is_kv_mcast)
+            else None
+        )
         mma_s_producer, mma_s_consumer = pipeline.PipelineUmmaAsync.create(
             num_stages=self.qk_acc_stage,
             producer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
             consumer_group=make_thread_cooperative_group(
-                len(self.softmax_warp_ids) * self.threads_per_warp * self.cluster_shape_mnk[0],
+                len(self.softmax_warp_ids) * self.threads_per_warp * mma_group_size,
             ),
             barrier_storage=storage.mma_s_mbar_ptr.data_ptr(),
             cta_layout_vmnk=cluster_layout_vmnk,
@@ -666,7 +835,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         p_mma_producer, p_mma_consumer = pipeline.PipelineAsyncUmma.create(
             num_stages=self.qk_acc_stage,
             producer_group=make_thread_cooperative_group(
-                len(self.softmax_warp_ids) * self.threads_per_warp * self.cluster_shape_mnk[0],
+                len(self.softmax_warp_ids) * self.threads_per_warp * mma_group_size,
             ),
             consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
             barrier_storage=storage.p_mma_mbar_ptr.data_ptr(),
@@ -699,7 +868,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             num_stages=self.mma_corr_stage,
             producer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
             consumer_group=make_thread_cooperative_group(
-                len(self.correction_warp_ids) * self.threads_per_warp * self.cluster_shape_mnk[0],
+                len(self.correction_warp_ids) * self.threads_per_warp * mma_group_size,
             ),
             barrier_storage=storage.mma_corr_mbar_ptr.data_ptr(),
             cta_layout_vmnk=cluster_layout_vmnk,
@@ -719,7 +888,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         # Initialize CLC state if using dynamic scheduler
         if cutlass.const_expr(self.use_clc_scheduler):
             clc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-            cluster_size = cute.size(self.cluster_shape_mnk)
             num_clc_consumer_threads = self.threads_per_warp * (
                 1  # sched_warp (CTA 0 only)
                 + cluster_size
@@ -736,7 +904,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             clc_response_ptr = storage.clc_response.data_ptr()
             clc = SchedulerState.create_clc(
                 hw_scheduler=ClcDynamicPersistentTileScheduler.create(
-                    self.tile_sched_params.clc_hw_params(),
+                    tile_sched_params.clc_hw_params(),
                     cute.arch.block_idx(),
                     cute.arch.grid_dim(),
                     clc_response_ptr,
@@ -893,7 +1061,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         cute.group_modes(tSgQ_qdl, 0, 3),
                     )
                     kv_cta_layout = cute.make_layout(
-                        cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
+                        cute.slice_(kv_cluster_layout_vmnk, (0, None, 0, 0)).shape
                     )
                     if cutlass.const_expr(mPageTable is None):
                         # Dense path: domain_offset K/V by batch block, select batch via mma_block_coord[2].
@@ -909,7 +1077,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         tSgK_kdl = qk_thr_mma.partition_B(gK_kdl)
                         tKsK, tKgK_kdl = cute.nvgpu.cpasync.tma_partition(
                             tma_atom_k,
-                            block_in_cluster_coord_vmnk[1],
+                            block_in_kv_cluster_coord_vmnk[1],
                             kv_cta_layout,
                             cute.group_modes(sK, 0, 3),
                             cute.group_modes(tSgK_kdl, 0, 3),
@@ -920,7 +1088,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         tSgV_dkl = pv_thr_mma.partition_B(gV_dkl)
                         tVsV, tVgV_dkl = cute.nvgpu.cpasync.tma_partition(
                             tma_atom_v,
-                            block_in_cluster_coord_vmnk[1],
+                            block_in_kv_cluster_coord_vmnk[1],
                             kv_cta_layout,
                             cute.group_modes(sV, 0, 3),
                             cute.group_modes(tSgV_dkl, 0, 3),
@@ -939,7 +1107,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         tSgK_kdl = qk_thr_mma.partition_B(gK_kdl)
                         tKsK, tKgK_kdl = cute.nvgpu.cpasync.tma_partition(
                             tma_atom_k,
-                            block_in_cluster_coord_vmnk[1],
+                            block_in_kv_cluster_coord_vmnk[1],
                             kv_cta_layout,
                             cute.group_modes(sK, 0, 3),
                             cute.group_modes(tSgK_kdl, 0, 3),
@@ -950,7 +1118,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         tSgV_dkl = pv_thr_mma.partition_B(gV_dkl)
                         tVsV, tVgV_dkl = cute.nvgpu.cpasync.tma_partition(
                             tma_atom_v,
-                            block_in_cluster_coord_vmnk[1],
+                            block_in_kv_cluster_coord_vmnk[1],
                             kv_cta_layout,
                             cute.group_modes(sV, 0, 3),
                             cute.group_modes(tSgV_dkl, 0, 3),
@@ -999,6 +1167,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                             else tKgK[None, 0, iter, k_page_idx],
                             tKsK[None, k_handle.index],
                             tma_bar_ptr=k_handle.barrier,
+                            mcast_mask=kv_mcast_mask,
                         )
                     kv_coord += 1
                     # v_page_idx_prev carries K[i-1]'s page index for use as V[i-1]'s page
@@ -1024,6 +1193,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 else tKgK[None, 0, iter, k_page_idx],
                                 tKsK[None, k_handle.index],
                                 tma_bar_ptr=k_handle.barrier,
+                                mcast_mask=kv_mcast_mask,
                             )
                         # Vi-1: reuse v_page_idx_prev (= K[i-1]'s page), no extra GMEM read.
                         for iter in cutlass.range(self.iterations_pv, unroll=1):
@@ -1035,6 +1205,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 else tVgV[None, iter, 0, v_page_idx_prev],
                                 tVsV[None, v_handle.index],
                                 tma_bar_ptr=v_handle.barrier,
+                                mcast_mask=kv_mcast_mask,
                             )
                         v_page_idx_prev = (
                             k_page_idx if cutlass.const_expr(mPageTable is not None) else None
@@ -1054,6 +1225,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                             else tVgV[None, iter, 0, v_page_idx_prev],
                             tVsV[None, v_handle.index],
                             tma_bar_ptr=v_handle.barrier,
+                            mcast_mask=kv_mcast_mask,
                         )
 
                 work_tile = tile_sched.advance_to_next_work()

@@ -63,6 +63,13 @@ POLY_EX2 = {
     ),
 }
 
+_fa_fwd_cluster_mode = os.environ.get("FA_FWD_CLUSTER_MODE", "2cta").lower()
+if _fa_fwd_cluster_mode not in ("2cta", "8cta+2cta/2cta"):
+    raise ValueError("FA_FWD_CLUSTER_MODE must be '2cta' or '8cta+2cta/2cta'")
+_fa_hd256_kv_stage = int(os.environ.get("FA_HD256_KV_STAGE", "4"))
+if not 2 <= _fa_hd256_kv_stage <= 12:
+    raise ValueError("FA_HD256_KV_STAGE must be between 2 and 12")
+
 _fa_clc_enabled: bool = os.environ.get("FA_CLC", "0") == "1"
 _fa_disable_2cta_enabled: bool = os.environ.get("FA_DISABLE_2CTA", "0") == "1"
 
@@ -86,6 +93,14 @@ def _is_cuda_12() -> bool:
 
 
 _fa_disable_2cta_cuda12: bool = _is_cuda_12()
+
+
+def _get_fwd_cluster_mode() -> str:
+    return _fa_fwd_cluster_mode
+
+
+def _get_hd256_kv_stage() -> int:
+    return _fa_hd256_kv_stage
 
 
 def _get_use_clc_scheduler_default() -> bool:

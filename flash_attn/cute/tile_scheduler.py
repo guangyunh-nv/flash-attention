@@ -349,6 +349,76 @@ class SingleTileScheduler:
         return scheduler
 
 
+class SingleTileClusterScheduler(SingleTileScheduler):
+    """Assign whole 2CTA tasks across heads without per-head cluster padding.
+
+    A preferred cluster contains four tasks; a fallback cluster contains one.
+    Clusters crossing a head/batch boundary must use pair-local K/V loads.
+    """
+
+    @dataclass
+    class Params(ParamsBase):
+        total_ctas: Int32
+        num_block_groups_divmod: FastDivmodDivisor
+        num_head_divmod: FastDivmodDivisor
+        cluster_shape_m: cutlass.Constexpr[int]
+
+    @staticmethod
+    def to_underlying_arguments(
+        args: TileSchedulerArguments,
+        *,
+        scheduling_mode: SchedulingMode = SchedulingMode.STATIC,
+        loc=None,
+        ip=None,
+    ) -> Params:
+        assert scheduling_mode == SchedulingMode.STATIC
+        assert not args.is_split_kv and not args.lpt
+        assert args.cluster_shape_mn in ((2, 1), (8, 1))
+        num_block_groups = cute.ceil_div(args.num_block, 2)
+        return SingleTileClusterScheduler.Params(
+            total_ctas=num_block_groups * args.num_head * args.num_batch * 2,
+            num_block_groups_divmod=FastDivmodDivisor(num_block_groups),
+            num_head_divmod=FastDivmodDivisor(args.num_head),
+            cluster_shape_m=args.cluster_shape_mn[0],
+        )
+
+    @staticmethod
+    def create(params: Params, ctx: SchedulerState | None = None, *, loc=None, ip=None):
+        return SingleTileClusterScheduler(params, cute.arch.block_idx(), loc=loc, ip=ip)
+
+    @staticmethod
+    def get_grid_shape(params: Params, *, loc=None, ip=None):
+        return (cute.round_up(params.total_ctas, params.cluster_shape_m), Int32(1), Int32(1))
+
+    @cute.jit
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        physical_cta = self._blk_coord[0]
+        head_batch, block_idx = divmod(physical_cta // 2, self.params.num_block_groups_divmod)
+        batch_idx, head_idx = divmod(head_batch, self.params.num_head_divmod)
+        return WorkTileInfo(
+            (Int32(block_idx), Int32(head_idx), Int32(batch_idx), Int32(0)),
+            self._is_first_block and physical_cta < self.params.total_ctas,
+        )
+
+    @cute.jit
+    def current_cluster_has_uniform_head_batch(self) -> Boolean:
+        first_cta = self._blk_coord[0] // self.params.cluster_shape_m * self.params.cluster_shape_m
+        first_head_batch, _ = divmod(first_cta // 2, self.params.num_block_groups_divmod)
+        last_head_batch, _ = divmod(
+            (first_cta + self.params.cluster_shape_m - 1) // 2, self.params.num_block_groups_divmod
+        )
+        return first_head_batch == last_head_batch
+
+    def __new_from_mlir_values__(self, values):
+        obj_list = []
+        for obj, n_items in zip([self.params, self._blk_coord], self._values_pos):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        scheduler = SingleTileClusterScheduler(*obj_list, loc=self._loc)
+        scheduler._is_first_block = self._is_first_block
+        return scheduler
+
+
 class StaticPersistentTileScheduler:
     @dataclass
     class Params(ParamsBase):
