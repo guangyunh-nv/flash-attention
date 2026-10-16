@@ -34,6 +34,8 @@ from cutlass.cutlass_dsl import BaseDSL
 from quack import copy_utils, layout_utils
 
 from flash_attn.cute.paged_kv import PagedKVManager
+from flash_attn.cute.paged_kv_tile import PagedKVTileIterator
+from flash_attn.cute.paged_kv_sm100 import PagedKVTileLoaderSm100
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
 import flash_attn.cute.pipeline as pipeline_custom
@@ -166,8 +168,14 @@ class FlashAttentionForwardSm100:
         has_tile_count_semaphore: bool = False,
         seqlen_k_per_split: Optional[int] = None,
         use_s_ping_pong: cutlass.Constexpr[bool] = False,
+        paged_kv_tile_iterator: bool = False,
     ):
         self.use_tma_KV = not paged_kv_non_tma
+        self.paged_kv_tile_iterator = paged_kv_tile_iterator
+        if paged_kv_tile_iterator:
+            assert self.use_tma_KV
+            assert head_dim == 128 and head_dim_v in (None, 128) and n_block_size == 128
+            assert not is_split_kv and not use_clc_scheduler and not use_s_ping_pong
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -678,6 +686,9 @@ class FlashAttentionForwardSm100:
 
         tma_atom_K = None
         tma_atom_V = None
+        paged_kv_raw = (mK, mV) if const_expr(self.paged_kv_tile_iterator) else None
+        if const_expr(self.paged_kv_tile_iterator):
+            assert mPageTable is not None
         if const_expr(self.use_tma_KV):
             # TMA load for K
             tma_atom_K, mK = cute.nvgpu.make_tiled_tma_atom_B(
@@ -844,6 +855,7 @@ class FlashAttentionForwardSm100:
             mQ,
             mK,
             mV,
+            paged_kv_raw,
             mO,
             mLSE,
             mCuSeqlensQ,
@@ -907,6 +919,7 @@ class FlashAttentionForwardSm100:
         mQ: cute.Tensor,  # (s_q, d, h, b) or (total_q, d, h) if there is cu_seqlens_q
         mK: cute.Tensor,  # (s_k, d, h_k, b_k) or (total_k, d, h_k) if there is cu_seqlens_k or (page_size, d, h_k, num_pages) if there is page_table
         mV: cute.Tensor,  # (d, s_k, h_k, b_k) or (d, total_k, h_k) if there is cu_seqlens_k or (d, page_size, h_k, num_pages) if there is page_table
+        paged_kv_raw: Optional[tuple],
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
         mCuSeqlensQ: Optional[cute.Tensor],
@@ -1318,6 +1331,7 @@ class FlashAttentionForwardSm100:
                 mQ,
                 mK,
                 mV,
+                paged_kv_raw,
                 sQ,
                 sK,
                 sV,
@@ -1484,6 +1498,18 @@ class FlashAttentionForwardSm100:
         return
 
     @cute.jit
+    def get_kv_page(self, page_table, batch_idx, sequence_length, page_size, tile_idx):
+        if const_expr(self.paged_kv_tile_iterator):
+            return PagedKVTileIterator.locate(
+                page_table[batch_idx, None], FastDivmodDivisorV2(page_size),
+                page_size, sequence_length, tile_idx * self.n_block_size, self.n_block_size,
+            )
+        elif const_expr(page_table is not None and self.use_tma_KV):
+            return page_table[batch_idx, tile_idx]
+        else:
+            return None
+
+    @cute.jit
     def load(
         self,
         thr_mma_qk: cute.ThrMma,
@@ -1491,6 +1517,7 @@ class FlashAttentionForwardSm100:
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
+        paged_kv_raw: Optional[tuple],
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
@@ -1636,7 +1663,37 @@ class FlashAttentionForwardSm100:
                 pipeline_kv=pipeline_kv,
                 K_or_V="V",
             )
+            if const_expr(self.paged_kv_tile_iterator):
+                assert len(self.load_warp_ids) == 1 and not self.use_block_sparsity
+                cta_rank = cute.arch.block_idx_in_cluster() if const_expr(self.use_2cta_instrs) else Int32(0)
+                row_offset = cta_rank * (self.n_block_size // self.cta_group_size)
+                fallback_K = PagedKVManager.create(
+                    mPageTable, *paged_kv_raw, FastDivmodDivisorV2(paged_kv_raw[0].shape[0]),
+                    batch_idx, head_idx_kv, tidx, seqlen.seqlen_k - row_offset, row_offset,
+                    self.n_block_size, self.head_dim_padded, self.head_dim_v_padded,
+                    num_load_threads, paged_kv_raw[0].element_type,
+                )
+                fallback_V = fallback_K
+                if const_expr(self.use_2cta_instrs):
+                    # QK partitions B along KV rows; PV partitions B along Dv.
+                    mV_fallback = cute.domain_offset(
+                        (cta_rank * (self.head_dim_v_padded // self.cta_group_size), 0, 0, 0), paged_kv_raw[1]
+                    )
+                    fallback_V = PagedKVManager.create(
+                        mPageTable, paged_kv_raw[0], mV_fallback, FastDivmodDivisorV2(paged_kv_raw[0].shape[0]),
+                        batch_idx, head_idx_kv, tidx, seqlen.seqlen_k, 0,
+                        self.n_block_size, self.head_dim_padded, self.head_dim_v_padded,
+                        num_load_threads, paged_kv_raw[0].element_type,
+                    )
+                iterator_args = (mK[None, None, head_idx_kv, None], mV[None, None, head_idx_kv, None],
+                                 thr_mma_qk, thr_mma_pv, self.cta_group_size)
+                load_K = partial(PagedKVTileLoaderSm100.load, fallback_K, *iterator_args, tma_atom_K, sK, pipeline_kv, K_or_V="K")
+                load_V = partial(PagedKVTileLoaderSm100.load, fallback_V, *iterator_args, tma_atom_V, sV, pipeline_kv, K_or_V="V")
 
+            page_lookup = partial(
+                self.get_kv_page, mPageTable, batch_idx, seqlen.seqlen_k,
+                paged_kv_raw[0].shape[0] if const_expr(self.paged_kv_tile_iterator) else None,
+            )
             if const_expr(not self.use_block_sparsity):
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen,
@@ -1648,11 +1705,7 @@ class FlashAttentionForwardSm100:
                     split_idx = split_idx & 0xFFFF
                 if self.process_work_tile(block_info, seqlen, n_block_min, n_block_max):
                     n_block_first = n_block_max - 1 if n_block_max > 0 else 0
-                    page_idx = (
-                        mPageTable[batch_idx, n_block_first]
-                        if const_expr(mPageTable is not None and self.use_tma_KV)
-                        else None
-                    )
+                    page_idx = page_lookup(n_block_first)
                     if const_expr(not self.use_tma_KV):
                         paged_kv_manager.load_page_table(n_block_first)
                     if issue_kv_for_this_warp:
@@ -1671,11 +1724,7 @@ class FlashAttentionForwardSm100:
                             kv_producer_state.advance()
                     for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
                         n_block = n_block_max - 2 - i
-                        page_idx = (
-                            mPageTable[batch_idx, n_block]
-                            if const_expr(mPageTable is not None and self.use_tma_KV)
-                            else None
-                        )
+                        page_idx = page_lookup(n_block)
                         if const_expr(not self.use_tma_KV):
                             paged_kv_manager.load_page_table(n_block)
                     # if cute.arch.thread_idx()[0] % 32 == 0: cute.printf("n_block = {}, page_idx = {}", n_block, page_idx)
@@ -1684,22 +1733,14 @@ class FlashAttentionForwardSm100:
                             kv_producer_state.advance()
                             if const_expr(self.use_s_ping_pong):
                                 # V lags K by one block to match the MMA order QK(i+1) -> PV(i)
-                                page_idx_v = (
-                                    mPageTable[batch_idx, n_block + 1]
-                                    if const_expr(mPageTable is not None and self.use_tma_KV)
-                                    else None
-                                )
+                                page_idx_v = page_lookup(n_block + 1)
                                 load_V(block=n_block + 1, producer_state=kv_producer_state, page_idx=page_idx_v)  # V(i-1)
                             else:
                                 load_V(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Vi
                             kv_producer_state.advance()
                     if const_expr(self.use_s_ping_pong):
                         if issue_kv_for_this_warp:
-                            page_idx_v = (
-                                mPageTable[batch_idx, n_block_min]
-                                if const_expr(mPageTable is not None and self.use_tma_KV)
-                                else None
-                            )
+                            page_idx_v = page_lookup(n_block_min)
                             load_V(block=n_block_min, producer_state=kv_producer_state, page_idx=page_idx_v)  # V_last
                             kv_producer_state.advance()
 
