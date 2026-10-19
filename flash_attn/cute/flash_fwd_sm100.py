@@ -392,7 +392,7 @@ class FlashAttentionForwardSm100:
                 self.num_regs_correction = 80
             else:
                 self.num_regs_softmax = 184
-                self.num_regs_correction = 64
+                self.num_regs_correction = 72
             # Divide the remaining register budget among the other WGs. Their setmaxnreg.dec
             # cannot exceed the launch register count.
             self.num_regs_other = min(
